@@ -5,6 +5,7 @@ from pathlib import Path
 import pty
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -24,38 +25,93 @@ class InstallerTests(unittest.TestCase):
         self.log = self.root / 'commands.jsonl'
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
+        for name in ('bash', 'sh', 'python3', 'cat', 'mkdir', 'mktemp', 'mv', 'chmod', 'rm', 'cp', 'touch', 'sha256sum', 'true', 'sleep'):
+            (bin_dir / name).symlink_to(shutil.which(name))
         command = '''#!/usr/bin/env python3
-import json, os, pathlib, shutil, sys
+import hashlib, json, os, pathlib, shutil, subprocess, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 with open(os.environ['SIMKEEP_TEST_LOG'], 'a') as output:
     output.write(json.dumps([name, *args]) + '\\n')
+state = pathlib.Path(os.environ['SIMKEEP_TEST_STATE'])
 if name == 'docker':
     if args == ['info']:
+        if os.getenv('SIMKEEP_TEST_ROOT_SOCKET') and not os.getenv('SIMKEEP_TEST_PRIVILEGED'):
+            sys.exit(1)
+        if os.getenv('SIMKEEP_TEST_STOPPED') and not (state / 'started').exists():
+            sys.exit(1)
         sys.exit(int(os.getenv('SIMKEEP_TEST_DOCKER_FAILURE', '0')))
+    if args == ['context', 'show']:
+        print(os.getenv('SIMKEEP_TEST_CONTEXT', 'default'))
+        sys.exit(0)
     if 'pull' in args:
         sys.exit(int(os.getenv('SIMKEEP_TEST_PULL_FAILURE', '0')))
     if 'version' in args:
+        if os.getenv('SIMKEEP_TEST_COMPOSE_MISSING') and not (state / 'plugin').exists():
+            sys.exit(1)
         print('2.39.0')
 elif name == 'curl':
     destination = pathlib.Path(args[args.index('-o') + 1])
+    url = args[-1]
+    if url == 'https://get.docker.com':
+        destination.write_text('cp "$SIMKEEP_TEST_DOCKER_FIXTURE" "$SIMKEEP_TEST_BIN/docker"\\ntouch "$SIMKEEP_TEST_STATE/engine"\\n')
+        sys.exit(0)
+    if '/docker/compose/releases/latest/download/' in url:
+        binary = b'compose-plugin-test-fixture\\n'
+        if url.endswith('.sha256'):
+            digest = '0' * 64 if os.getenv('SIMKEEP_TEST_BAD_CHECKSUM') else hashlib.sha256(binary).hexdigest()
+            destination.write_text(digest + '  ' + url.rsplit('/', 1)[-1].removesuffix('.sha256') + '\\n')
+        else:
+            destination.write_bytes(binary)
+        sys.exit(0)
     source = pathlib.Path(os.environ['SIMKEEP_TEST_FIXTURES']) / args[-1].rsplit('/', 1)[-1]
     if source.name == '.env.example' and os.getenv('SIMKEEP_TEST_DOWNLOAD_FAILURE'):
         destination.write_text('partial download')
         sys.exit(22)
     shutil.copyfile(source, destination)
+elif name == 'uname':
+    print(os.getenv('SIMKEEP_TEST_SYSTEM', 'Linux') if '-s' in args else os.getenv('SIMKEEP_TEST_ARCH', 'aarch64'))
+elif name == 'id':
+    print(os.getenv('SIMKEEP_TEST_UID', '0'))
+elif name == 'awk':
+    if args[-1] == '/etc/os-release':
+        print(os.getenv('SIMKEEP_TEST_DISTRO', 'ubuntu'))
+    else:
+        os.execv(os.environ['SIMKEEP_TEST_AWK'], [os.environ['SIMKEEP_TEST_AWK'], *args])
+elif name in ('systemctl', 'service'):
+    if os.getenv('SIMKEEP_TEST_DOCKER_FAILURE'):
+        sys.exit(1)
+    (state / 'started').touch()
+elif name == 'install':
+    if args[-1].endswith('/docker-compose'):
+        (state / 'plugin').touch()
+elif name == 'sudo':
+    if os.getenv('SIMKEEP_TEST_SUDO_FAILURE'):
+        sys.exit(1)
+    args = [arg for arg in args if arg != '-n']
+    if args == ['-v']:
+        sys.exit(0)
+    environment = dict(os.environ, SIMKEEP_TEST_PRIVILEGED='1')
+    sys.exit(subprocess.call(args, env=environment))
 '''
-        for name in ('docker', 'curl'):
+        for name in ('docker', 'curl', 'uname', 'id', 'awk', 'systemctl', 'service', 'install', 'sudo'):
             executable = bin_dir / name
             executable.write_text(command)
             executable.chmod(0o755)
         self.environment = dict(os.environ)
-        for name in ('SIMKEEP_IMAGE', 'SIMKEEP_PORT', 'SIMKEEP_PUBLIC_URL', 'SIMKEEP_ENV_FILE'):
+        for name in ('SIMKEEP_IMAGE', 'SIMKEEP_PORT', 'SIMKEEP_PUBLIC_URL', 'SIMKEEP_ENV_FILE', 'DOCKER_HOST', 'DOCKER_CONTEXT'):
             self.environment.pop(name, None)
+        (self.root / 'state').mkdir()
+        docker_fixture = self.root / 'fake-docker'
+        shutil.copy2(bin_dir / 'docker', docker_fixture)
         self.environment.update({
-            'PATH': str(bin_dir) + os.pathsep + self.environment.get('PATH', ''),
+            'PATH': str(bin_dir),
             'SIMKEEP_TEST_LOG': str(self.log),
             'SIMKEEP_TEST_FIXTURES': str(ROOT),
+            'SIMKEEP_TEST_STATE': str(self.root / 'state'),
+            'SIMKEEP_TEST_BIN': str(bin_dir),
+            'SIMKEEP_TEST_DOCKER_FIXTURE': str(docker_fixture),
+            'SIMKEEP_TEST_AWK': shutil.which('awk'),
         })
 
     def install(self, *options, environment=None):
@@ -92,6 +148,7 @@ elif name == 'curl':
         self.assertIn(str(self.destination / 'docker-compose.yml'), docker[up])
         self.assertIn('http://example.invalid:5301', result.stdout)
         self.assertFalse(any('down' in args or 'build' in args for args in docker))
+        self.assertFalse(any(args[0] in ('sudo', 'systemctl', 'service', 'install') for args in self.commands()))
 
     def test_noninteractive_defaults_work_without_a_terminal(self):
         result = self.install()
@@ -150,6 +207,63 @@ elif name == 'curl':
         self.assertTrue(any('pull' in args for args in self.commands()))
         self.assertFalse(any('up' in args for args in self.commands()))
         self.assertNotIn('部署完成', result.stdout)
+
+    def test_missing_docker_is_installed_from_the_official_script(self):
+        (Path(self.environment['SIMKEEP_TEST_BIN']) / 'docker').unlink()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / 'state/engine').exists())
+        self.assertTrue(any(args[0] == 'curl' and args[-1] == 'https://get.docker.com' for args in self.commands()))
+        self.assertTrue((self.destination / '.env').is_file())
+
+    def test_missing_compose_is_installed_without_reinstalling_the_engine(self):
+        result = self.install(environment=dict(self.environment, SIMKEEP_TEST_COMPOSE_MISSING='1'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / 'state/plugin').exists())
+        self.assertFalse((self.root / 'state/engine').exists())
+        self.assertFalse(any(args[-1] == 'https://get.docker.com' for args in self.commands()))
+
+    def test_corrupt_compose_download_is_rejected_before_installation(self):
+        environment = dict(self.environment, SIMKEEP_TEST_COMPOSE_MISSING='1', SIMKEEP_TEST_BAD_CHECKSUM='1')
+        result = self.install(environment=environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(any(args[0] == 'curl' and args[-1].endswith('.sha256') for args in self.commands()))
+        self.assertFalse((self.root / 'state/plugin').exists())
+        self.assertFalse(any('up' in args for args in self.commands()))
+
+    def test_stopped_local_docker_is_started(self):
+        result = self.install(environment=dict(self.environment, SIMKEEP_TEST_STOPPED='1'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / 'state/started').exists())
+
+    def test_nonroot_user_can_deploy_with_sudo_without_changing_group_membership(self):
+        environment = dict(self.environment, SIMKEEP_TEST_UID='1000', SIMKEEP_TEST_ROOT_SOCKET='1')
+        result = self.install(environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(args[0] == 'sudo' and 'up' in args for args in self.commands()))
+        self.assertFalse((self.root / 'state/started').exists())
+
+    def test_unavailable_sudo_fails_before_changing_the_system(self):
+        (Path(self.environment['SIMKEEP_TEST_BIN']) / 'docker').unlink()
+        environment = dict(self.environment, SIMKEEP_TEST_UID='1000', SIMKEEP_TEST_SUDO_FAILURE='1')
+        result = self.install(environment=environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('root', result.stderr)
+        self.assertFalse(any(args[0] == 'curl' for args in self.commands()))
+
+    def test_unsupported_system_is_rejected_before_running_the_docker_installer(self):
+        (Path(self.environment['SIMKEEP_TEST_BIN']) / 'docker').unlink()
+        result = self.install(environment=dict(self.environment, SIMKEEP_TEST_DISTRO='arch'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('arch', result.stderr)
+        self.assertFalse(any(args[0] == 'curl' for args in self.commands()))
+
+    def test_unreachable_remote_docker_does_not_start_a_local_service(self):
+        environment = dict(self.environment, SIMKEEP_TEST_DOCKER_FAILURE='1', DOCKER_HOST='tcp://example.invalid:2376')
+        result = self.install(environment=environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('DOCKER_HOST', result.stderr)
+        self.assertFalse(any(args[0] in ('sudo', 'systemctl', 'service') for args in self.commands()))
 
     @unittest.skipUnless(hasattr(pty, 'fork'), 'Requires a Unix controlling terminal')
     def test_piped_script_reads_installation_answers_from_the_terminal(self):

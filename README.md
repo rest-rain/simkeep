@@ -62,13 +62,15 @@ SIMKEEP 是一个可自行部署的 SIM / eSIM 管理平台。把开通日期、
 
 ### 一键部署
 
-服务器已安装 Docker、Compose 插件和 curl 后，执行：
+Linux 服务器准备好 curl 后，使用 root 或有 sudo 权限的用户执行：
 
 ```bash
 bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/rest-rain/simkeep/main/install.sh | bash'
 ```
 
-脚本默认部署到当前目录下的 `simkeep` 文件夹，首次运行询问端口和 HTTP 访问地址，下载配置并启动镜像。打开显示的地址后创建账号。
+脚本会自动安装缺少的 Docker Engine / Compose 插件并启动 Docker 服务，已有可用环境则直接复用。支持 Docker 官方仍支持的 Ubuntu、Debian、CentOS Stream、Rocky Linux、RHEL 和 Fedora，架构为 `amd64` / `arm64`。
+
+默认部署到当前目录下的 `simkeep` 文件夹，首次运行询问端口和 HTTP 访问地址，下载配置并启动镜像。打开显示的地址后创建账号。
 
 再次从同一目录执行相同命令会保留已有 `.env`、`docker-compose.yml` 和数据卷，拉取镜像并更新容器。指定目录、无人值守部署等用法见 [一键部署说明](docs/DOCKER.md#一键部署)。
 

@@ -4,13 +4,17 @@
 
 ## 一键部署
 
-准备好 Docker Engine、Compose 插件及 curl，在服务器执行：
+Linux 服务器准备好 curl 后，使用 root 或有 sudo 权限的用户执行：
 
 ```bash
 bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/rest-rain/simkeep/main/install.sh | bash'
 ```
 
-首次运行会询问宿主机端口和 HTTP 访问地址。远程部署时填写例如 `http://服务器IP:5180` 的地址；本机试用可直接回车。默认部署目录为当前目录下的 `simkeep`，镜像为 `ghcr.io/rest-rain/simkeep:latest`。Docker 需要已启动，当前用户需能执行 `docker info`。
+首次运行会询问宿主机端口和 HTTP 访问地址。远程部署时填写例如 `http://服务器IP:5180` 的地址；本机试用可直接回车。默认部署目录为当前目录下的 `simkeep`，镜像为 `ghcr.io/rest-rain/simkeep:latest`。
+
+Docker Engine 缺失时，脚本从 `https://get.docker.com` 下载官方安装脚本并执行；只有 Compose 缺失时，从 Docker 官方 GitHub 发布页下载插件，校验 SHA256 后安装。Docker 服务未启动时，使用 systemd 或 service 启动；已有可用环境直接复用。
+
+自动安装支持 Docker 官方仍支持的 Ubuntu、Debian、CentOS Stream、Rocky Linux、RHEL 和 Fedora，支持 `amd64` / `arm64`。安装组件、启动服务或访问受限的 Docker socket 时，需要 root 或 sudo 权限。非 root 用户按提示完成 sudo 验证后，脚本会通过 sudo 调用需要权限的命令。
 
 脚本下载缺少的配置文件，创建权限为 `600` 的 `.env`，验证 Compose 配置、拉取镜像并等待健康检查。成功后显示配置目录和访问提示；登录网页后，每个人在“通知设置”配置自己的 Telegram / SMTP。
 
@@ -22,11 +26,11 @@ bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/rest-rain/simk
 bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/rest-rain/simkeep/main/install.sh | bash -s -- --dir ./simkeep --port 5180 --url http://your-server:5180 --non-interactive'
 ```
 
-`--port`、`--url` 仅用于首次创建 `.env`；已有配置时按文件内容部署。重复执行时使用同一个 `--dir`。没有交互终端且未提供参数时，默认使用端口 `5180` 和 `http://localhost:5180`；远程部署请填写实际地址。
+`--port`、`--url` 仅用于首次创建 `.env`；已有配置时按文件内容部署。重复执行时使用同一个 `--dir`。无人值守安装需要 root 或免密码 sudo。没有交互终端且未提供参数时，默认使用端口 `5180` 和 `http://localhost:5180`；远程部署请填写实际地址。
 
 ## 在新服务器部署
 
-部署只需要 `docker-compose.yml` 和 `.env`。可下载配置文件及空白模板：
+手动部署需先安装 Docker Engine 和 Compose 插件。应用只需要 `docker-compose.yml` 和 `.env`，可下载配置文件及空白模板：
 
 ```bash
 mkdir -p simkeep

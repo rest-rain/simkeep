@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 DOWNLOAD_BASE='https://raw.githubusercontent.com/rest-rain/simkeep/main'
 staging=''
+docker_staging=''
+root_command=()
+docker_command=(docker)
+root_ready=0
 
 fail() {
   printf '错误：%s\n' "$*" >&2
@@ -10,9 +14,12 @@ fail() {
 }
 
 cleanup() {
-  if [[ -n "$staging" ]]; then
-    rm -rf -- "$staging"
-  fi
+  local directory
+  for directory in "$staging" "$docker_staging"; do
+    if [[ -n "$directory" ]]; then
+      rm -rf -- "$directory"
+    fi
+  done
 }
 
 usage() {
@@ -25,7 +32,7 @@ usage() {
   --non-interactive     使用参数或默认值，不询问配置
   --help                显示帮助
 
-需要已安装且可用的 Docker Engine、Docker Compose 插件和 curl。
+需要 curl；Linux 上缺少 Docker / Compose 时会自动安装，需要 root 或 sudo 权限。
 已有 .env 和 docker-compose.yml 会保留；端口、地址参数仅用于首次部署。
 再次执行会按已有配置拉取镜像并更新容器，数据保存在原命名卷中。
 USAGE
@@ -60,6 +67,122 @@ download() {
   [[ -s "$staging/$1" ]] || fail "下载的 $1 为空，请重试。"
 }
 
+require_root() {
+  if ((root_ready)); then
+    return
+  fi
+  if [[ "$(id -u)" != '0' ]]; then
+    command -v sudo >/dev/null 2>&1 || fail '自动安装或启动 Docker 需要 root 权限，请使用 root 或 sudo 运行。'
+    if (($1)); then
+      sudo -v || fail '无法取得 root 权限，请使用 root 或可用的 sudo 运行。'
+      root_command=(sudo)
+    else
+      sudo -n true || fail '无人值守安装需要 root 或免密码 sudo 权限。'
+      root_command=(sudo -n)
+    fi
+  fi
+  root_ready=1
+}
+
+require_linux() {
+  [[ "$(uname -s)" == 'Linux' ]] || fail '自动安装 Docker / Compose 仅支持 Linux；其他系统请先安装 Docker Desktop。'
+  case "$(uname -m)" in
+    x86_64|amd64|aarch64|arm64) ;;
+    *) fail '自动安装目前支持 amd64 / arm64。' ;;
+  esac
+}
+
+prepare_docker_downloads() {
+  if [[ -z "$docker_staging" ]]; then
+    docker_staging=$(
+      umask 077
+      mktemp -d "${TMPDIR:-/tmp}/simkeep-docker.XXXXXX"
+    )
+    trap cleanup EXIT
+  fi
+}
+
+install_engine() {
+  local distro
+  require_linux
+  [[ -r /etc/os-release ]] || fail '无法识别 Linux 发行版，请手动安装 Docker。'
+  distro=$(awk -F= '$1 == "ID" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
+  case "$distro" in
+    ubuntu|debian|centos|rocky|rhel|fedora) ;;
+    *) fail "当前发行版 ${distro:-未知} 不支持自动安装，请手动安装 Docker 后重试。" ;;
+  esac
+  require_root "$1"
+  prepare_docker_downloads
+  printf '未检测到 Docker，正在使用 Docker 官方脚本安装。\n'
+  curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+    -o "$docker_staging/docker-install.sh" https://get.docker.com || fail 'Docker 官方安装脚本下载失败，请检查网络。'
+  [[ -s "$docker_staging/docker-install.sh" ]] || fail 'Docker 官方安装脚本为空。'
+  "${root_command[@]}" sh "$docker_staging/docker-install.sh" || fail 'Docker 自动安装失败，请检查安装输出后重试。'
+  hash -r
+  command -v docker >/dev/null 2>&1 || fail '安装完成后仍找不到 Docker 命令。'
+}
+
+install_compose() {
+  local architecture filename expected actual directory='/usr/local/lib/docker/cli-plugins'
+  require_linux
+  command -v sha256sum >/dev/null 2>&1 || fail '安装 Compose 需要 sha256sum，请先安装 coreutils。'
+  require_root "$1"
+  prepare_docker_downloads
+  case "$(uname -m)" in
+    x86_64|amd64) architecture=x86_64 ;;
+    aarch64|arm64) architecture=aarch64 ;;
+  esac
+  filename="docker-compose-linux-$architecture"
+  printf '未检测到可用的 Compose 插件，正在下载官方版本。\n'
+  curl -fsSL --connect-timeout 15 --max-time 180 --retry 2 \
+    -o "$docker_staging/$filename" "https://github.com/docker/compose/releases/latest/download/$filename" || fail 'Compose 下载失败。'
+  curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+    -o "$docker_staging/$filename.sha256" "https://github.com/docker/compose/releases/latest/download/$filename.sha256" || fail 'Compose 校验文件下载失败。'
+  expected=$(awk 'NR == 1 { print $1 }' "$docker_staging/$filename.sha256")
+  actual=$(sha256sum "$docker_staging/$filename")
+  actual=${actual%% *}
+  [[ "$expected" =~ ^[[:xdigit:]]{64}$ && "$actual" == "$expected" ]] || fail 'Compose 文件校验失败，已停止安装，请重试。'
+  "${root_command[@]}" install -d -m 0755 "$directory"
+  "${root_command[@]}" install -m 0755 "$docker_staging/$filename" "$directory/docker-compose"
+}
+
+ensure_docker() {
+  local context _attempt
+  if ! command -v docker >/dev/null 2>&1; then
+    [[ -z "${DOCKER_HOST:-}" && -z "${DOCKER_CONTEXT:-}" ]] || fail '已设置 DOCKER_HOST / DOCKER_CONTEXT，请先安装并配置所选 Docker 客户端。'
+    install_engine "$1"
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    [[ -z "${DOCKER_HOST:-}" ]] || fail '无法连接 DOCKER_HOST 指定的 Docker，请检查连接配置。'
+    context=$(docker context show 2>/dev/null) || fail '无法读取 Docker context，请检查 Docker 客户端。'
+    [[ "$context" == 'default' ]] || fail "无法连接 Docker context $context，请先启动或修复该环境。"
+    require_linux
+    require_root "$1"
+    docker_command=("${root_command[@]}" docker)
+    if ! "${docker_command[@]}" info >/dev/null 2>&1; then
+      printf '正在启动 Docker 服务。\n'
+      if command -v systemctl >/dev/null 2>&1 && "${root_command[@]}" systemctl enable --now docker; then
+        :
+      elif command -v service >/dev/null 2>&1 && "${root_command[@]}" service docker start; then
+        :
+      else
+        fail '无法启动 Docker 服务，请检查 Docker 安装与系统服务管理器。'
+      fi
+      for _attempt in {1..20}; do
+        if "${docker_command[@]}" info >/dev/null 2>&1; then
+          break
+        fi
+        sleep 1
+      done
+      "${docker_command[@]}" info >/dev/null 2>&1 || fail 'Docker 服务未就绪，请检查 Docker 服务日志。'
+    fi
+  fi
+  if ! "${docker_command[@]}" compose version >/dev/null 2>&1; then
+    install_compose "$1"
+    "${docker_command[@]}" compose version >/dev/null 2>&1 || fail 'Compose 安装后仍不可用，请检查 Docker 客户端或已有插件。'
+  fi
+}
+
 main() {
   local install_dir="$PWD/simkeep" port='' public_url='' interactive=1 has_terminal=0
   local new_env=1 new_compose=1
@@ -87,11 +210,9 @@ main() {
     validate_url "$public_url"
     public_url=${public_url%/}
   fi
-  for dependency in docker curl awk; do
+  for dependency in curl awk; do
     command -v "$dependency" >/dev/null 2>&1 || fail "缺少 $dependency，请先安装。"
   done
-  docker info >/dev/null 2>&1 || fail 'Docker 未启动或当前用户没有权限，请先确认 docker info 能正常执行。'
-  docker compose version >/dev/null 2>&1 || fail '请先安装 Docker Compose 插件，确认 docker compose version 能正常执行。'
 
   [[ ! -e "$install_dir" || -d "$install_dir" ]] || fail '部署目录已经存在，但不是文件夹。'
   for configuration in .env docker-compose.yml; do
@@ -127,6 +248,7 @@ main() {
     printf '保留已有 .env，按其中的配置部署；如需调整端口或地址，请编辑该文件。\n'
   fi
 
+  ensure_docker "$interactive"
   umask 077
   mkdir -p -- "$install_dir"
   install_dir=$(cd -- "$install_dir" && pwd -P)
@@ -154,7 +276,7 @@ main() {
   fi
   chmod 600 -- "$install_dir/.env"
 
-  local compose=(docker compose --project-directory "$install_dir" --env-file "$install_dir/.env" -f "$install_dir/docker-compose.yml")
+  local compose=("${docker_command[@]}" compose --project-directory "$install_dir" --env-file "$install_dir/.env" -f "$install_dir/docker-compose.yml")
   "${compose[@]}" config --quiet || fail 'Compose 配置验证失败，请检查部署目录中的配置文件。'
   "${compose[@]}" pull web || fail '镜像拉取失败，请检查网络和 .env 中的 SIMKEEP_IMAGE 后重试。'
   "${compose[@]}" up -d --wait --wait-timeout 120 web || fail '容器未通过健康检查，请在部署目录执行 docker compose logs --tail=100 web。'
